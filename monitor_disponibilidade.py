@@ -28,6 +28,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
 ENV_PATH = Path(__file__).parent / ".env"
@@ -53,6 +54,12 @@ DATA_FIM_VALIDACAO = datetime(2026, 10, 26, tzinfo=timezone.utc)
 
 
 async def checar_uma_vez() -> dict:
+    """Usa client.conversation() (orientado a evento) em vez de ficar perguntando
+    'chegou? chegou?' uma vez por segundo -- a versao anterior (polling manual com
+    get_messages a cada 1s, ate 40x por checagem) provavelmente estava esbarrando
+    em limitacao de taxa do Telegram pra contas de usuario comum, causando falsos
+    negativos de indisponibilidade (confirmado: o bot NUNCA reiniciou no Railway
+    durante o periodo em que essas falhas apareceram no log)."""
     client = TelegramClient(SESSAO, API_ID, API_HASH)
     await client.start()
 
@@ -60,37 +67,35 @@ async def checar_uma_vez() -> dict:
     agora = datetime.now(timezone.utc)
     texto_teste = f"[monitor] teste automatico {agora.isoformat()}"
 
-    inicio = time.perf_counter()
-    await client.send_message(bot, texto_teste)
-
     sucesso = False
     tempo_resposta = None
-    fim_espera = inicio + TIMEOUT_SEGUNDOS
-    while time.perf_counter() < fim_espera:
-        await asyncio.sleep(1)
-        mensagens = await client.get_messages(bot, limit=3)
-        for msg in mensagens:
-            if msg.out:
-                continue
-            if msg.date.replace(tzinfo=timezone.utc) > agora:
-                sucesso = True
-                tempo_resposta = round(time.perf_counter() - inicio, 3)
-                break
-        if sucesso:
-            break
+    erro = ""
+    try:
+        inicio = time.perf_counter()
+        async with client.conversation(bot, timeout=TIMEOUT_SEGUNDOS) as conv:
+            await conv.send_message(texto_teste)
+            await conv.get_response()
+        sucesso = True
+        tempo_resposta = round(time.perf_counter() - inicio, 3)
+    except asyncio.TimeoutError:
+        pass  # sem resposta dentro do timeout -- conta como indisponibilidade real
+    except FloodWaitError as e:
+        erro = f"FloodWaitError: aguardar {e.seconds}s"
 
     await client.disconnect()
     return {
         "timestamp_utc": agora.isoformat(),
         "sucesso": sucesso,
         "tempo_resposta_segundos": tempo_resposta if tempo_resposta is not None else "",
+        "erro": erro,  # so pra log/diagnostico no console -- nao vai pro CSV, mantem o schema estavel
     }
 
 
 def registrar(resultado: dict) -> None:
     novo_arquivo = not LOG_PATH.exists()
+    campos = ["timestamp_utc", "sucesso", "tempo_resposta_segundos"]
     with open(LOG_PATH, "a", newline="", encoding="utf-8") as f:
-        escritor = csv.DictWriter(f, fieldnames=["timestamp_utc", "sucesso", "tempo_resposta_segundos"])
+        escritor = csv.DictWriter(f, fieldnames=campos, extrasaction="ignore")
         if novo_arquivo:
             escritor.writeheader()
         escritor.writerow(resultado)
@@ -107,6 +112,8 @@ def main() -> None:
 
     if resultado["sucesso"]:
         print(f"OK -- respondeu em {resultado['tempo_resposta_segundos']}s")
+    elif resultado["erro"]:
+        print(f"FALHA (erro do lado do monitor, nao necessariamente do bot): {resultado['erro']}")
     else:
         print(f"FALHA -- sem resposta em {TIMEOUT_SEGUNDOS}s (timestamp: {resultado['timestamp_utc']})")
 
