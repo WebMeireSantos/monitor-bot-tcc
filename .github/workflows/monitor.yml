@@ -8,6 +8,16 @@ on:
 permissions:
   contents: write
 
+# Evita que duas execucoes rodem ao mesmo tempo -- sem isso, uma execucao
+# agendada que dispara enquanto outra (manual ou agendada) ainda esta
+# salvando o log gera conflito de merge em disponibilidade_log.csv e a
+# execucao falha inteira, mesmo a checagem em si tendo funcionado.
+# cancel-in-progress: false para nao perder checagens -- elas esperam na
+# fila em vez de serem canceladas.
+concurrency:
+  group: monitor-log
+  cancel-in-progress: false
+
 jobs:
   checar:
     runs-on: ubuntu-latest
